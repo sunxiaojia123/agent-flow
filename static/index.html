@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Flow - 技能调度交易系统</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="header">
+  <h1>Agent Flow <span class="badge">技能调度 · Supervisor 模式</span></h1>
+</header>
+
+<div class="main-container">
+
+  <!-- Left: Chat Panel -->
+  <div class="panel chat-panel" id="chatPanel">
+    <div class="panel-header">对话</div>
+    <div class="chat-messages" id="chatMessages">
+      <div class="welcome-msg">
+        <p>欢迎使用技能调度交易系统</p>
+        <p class="hint">
+          试试说：<br>
+          "你好" — 直接回复<br>
+          "我想在上海买500吨螺纹钢" — 技能调度<br>
+          "帮我查一下库存" — 弹窗收集参数
+        </p>
+      </div>
+    </div>
+    <div class="chat-input-area">
+      <textarea id="chatInput" rows="2" placeholder="输入您的问题... (Enter 发送, Shift+Enter 换行)"></textarea>
+      <button id="sendBtn" class="btn btn-primary">发送</button>
+    </div>
+  </div>
+
+  <!-- Center: Scheduling Panel -->
+  <div class="panel flow-panel" id="flowPanel">
+    <div class="panel-header">调度监控</div>
+
+    <!-- Supervisor status -->
+    <div class="section">
+      <div class="section-title">Supervisor 决策历史</div>
+      <div class="decision-list" id="decisionList">
+        <div class="empty-hint">等待消息...</div>
+      </div>
+    </div>
+
+    <!-- Skill loading timeline -->
+    <div class="section">
+      <div class="section-title">技能 & 工具调用</div>
+      <div class="node-timeline" id="nodeTimeline">
+        <div class="empty-hint">等待执行...</div>
+      </div>
+    </div>
+
+    <!-- SSE event log -->
+    <div class="section section-grow">
+      <div class="section-title">SSE 事件日志</div>
+      <div class="event-log" id="eventLog">
+        <div class="empty-hint">等待事件...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right: Skill Panel -->
+  <div class="panel history-panel" id="skillPanel">
+    <div class="panel-header">
+      可用技能
+      <button class="btn btn-sm" id="reloadSkillsBtn" title="热加载技能">↻</button>
+    </div>
+    <div class="skill-list" id="skillList">
+      <div class="empty-hint">加载中...</div>
+    </div>
+  </div>
+
+</div>
+
+<footer class="status-bar" id="statusBar">
+  <span id="statusConv">会话: 新建</span>
+  <span id="statusPhase">阶段: 就绪</span>
+  <span id="statusConn" class="dot-green">已连接</span>
+</footer>
+
+<!-- Templates -->
+<template id="tmplUserMsg">
+  <div class="msg msg-user">
+    <div class="msg-role">你</div>
+    <div class="msg-content"></div>
+    <div class="msg-time"></div>
+  </div>
+</template>
+
+<template id="tmplAsstMsg">
+  <div class="msg msg-asst">
+    <div class="msg-role">Agent</div>
+    <div class="msg-content"></div>
+    <div class="msg-time"></div>
+  </div>
+</template>
+
+<template id="tmplPopupCard">
+  <div class="popup-card">
+    <div class="popup-header">请补充以下信息</div>
+    <div class="popup-fields"></div>
+    <button class="btn btn-primary popup-submit">提交</button>
+  </div>
+</template>
+
+<template id="tmplTradeCard">
+  <div class="trade-card">
+    <div class="trade-summary"></div>
+    <div class="trade-recommendations"></div>
+  </div>
+</template>
+
+<template id="tmplDecisionItem">
+  <div class="decision-item">
+    <div class="decision-arrow">→</div>
+    <div class="decision-content"></div>
+  </div>
+</template>
+
+<template id="tmplNodeItem">
+  <div class="node-item">
+    <span class="node-icon"></span>
+    <span class="node-label"></span>
+  </div>
+</template>
+
+<template id="tmplEventItem">
+  <div class="event-item">
+    <span class="event-time"></span>
+    <span class="event-tag"></span>
+    <span class="event-detail"></span>
+  </div>
+</template>
+
+<template id="tmplSkillItem">
+  <div class="skill-item">
+    <div class="skill-name"></div>
+    <div class="skill-desc"></div>
+    <div class="skill-apis"></div>
+  </div>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
