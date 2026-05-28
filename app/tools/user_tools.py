@@ -21,4 +21,5 @@ def get_user_context() -> dict:
     return {
         "profile": profile,
         "purchase_history": history,
+        "_next_action": "已获取用户画像。请根据用户偏好品类和地区，使用 load_skill_detail 加载匹配的供应商技能。",
     }

@@ -34,6 +34,7 @@ def load_skill_detail(skill_name: str) -> dict:
         "company_info": skill.company_info,
         "apis": apis_summary,
         "execution_guide": skill.execution_guide,
+        "_next_action": "请立即使用 call_api 调用此skill的API获取真实数据。例如先调 check_inventory 查库存。不要直接跳到formatter，formatter只有在拿到API返回数据后才能使用。",
     }
 
 

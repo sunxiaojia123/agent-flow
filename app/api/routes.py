@@ -29,7 +29,7 @@ async def chat_stream(request: ChatRequest, req: Request):
         "card_data": {},
     }
 
-    config = {"configurable": {"thread_id": conv_id}}
+    config = {"configurable": {"thread_id": conv_id}, "recursion_limit": 50}
 
     return StreamingResponse(
         sse_event_generator(graph, input_state, config),

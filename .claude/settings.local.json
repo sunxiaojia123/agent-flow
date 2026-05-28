@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "Bash(python *)",
+      "Bash(curl -s -N -X POST http://localhost:8001/api/v1/chat/stream -H 'Content-Type: application/json' -d '{\"message\": \"我想在上海买500吨螺纹钢\"}' --max-time 120)",
+      "Bash(pkill -f \"python -m app.main\")",
+      "Bash(python3 *)"
     ]
   }
 }
