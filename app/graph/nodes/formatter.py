@@ -50,13 +50,18 @@ def create_formatter_popup_node():
                 field["min"] = f.get("min", 1)
             built_fields.append(field)
 
+        # Generate guidance text
+        field_labels = [f["label"] for f in built_fields]
+        guidance = f"请补充以下信息：{'、'.join(field_labels)}"
+
         return Command(
             goto="__end__",
             update={
                 "final_action": "popup",
                 "popup_message": message,
                 "popup_fields": built_fields,
-                "messages": [AIMessage(content=f"[弹窗] {message}")],
+                "guidance_message": guidance,
+                "messages": [AIMessage(content=guidance)],
             }
         )
 
@@ -69,13 +74,26 @@ def create_formatter_card_node():
         card_type = state.get("card_type") or decision.get("card_type", "trade")
         card_data = state.get("card_data") or decision.get("card_data", {})
 
+        # Generate guidance text based on card content
+        recs = card_data.get("recommendations", [])
+        summary = card_data.get("summary", {})
+        if recs:
+            supplier_names = "、".join(r.get("company_name", "") for r in recs[:2])
+            guidance = f"根据查询结果，为您推荐 {supplier_names}，请查看下方卡片详情。"
+        elif summary:
+            product = summary.get("product", "产品")
+            guidance = f"已为您找到 {product} 的采购方案，请查看下方卡片。"
+        else:
+            guidance = "已为您生成交易方案，请查看下方卡片。"
+
         return Command(
             goto="__end__",
             update={
                 "final_action": "card",
                 "card_type": card_type,
                 "card_data": card_data,
-                "messages": [AIMessage(content=f"[卡片: {card_type}]")],
+                "guidance_message": guidance,
+                "messages": [AIMessage(content=guidance)],
             }
         )
 

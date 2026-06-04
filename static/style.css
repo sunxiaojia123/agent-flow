@@ -233,6 +233,7 @@ body {
 }
 .tag-meta { background: #e8eaf6; color: #283593; }
 .tag-text { background: #e8f5e9; color: #2e7d32; }
+.tag-thinking { background: #ede9fe; color: #5b21b6; }
 .tag-popup { background: #fff3e0; color: #e65100; }
 .tag-card { background: #fce4ec; color: #880e4f; }
 .tag-error { background: #ffebee; color: #c62828; }
@@ -271,6 +272,25 @@ body {
 ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
 
 .empty-hint { color: var(--text-muted); font-size: 12px; text-align: center; padding: 20px; }
+
+/* Status messages in chat */
+.msg-status { margin: 4px 0; }
+.msg-status-content {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 12px;
+  font-size: 12px; line-height: 1.4;
+  background: #f5f5f5; color: var(--text-secondary);
+}
+.msg-status-icon {
+  width: 6px; height: 6px; border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-thinking .msg-status-content { background: #ede9fe; color: #5b21b6; }
+.status-thinking .msg-status-icon { background: #7c3aed; animation: blink 1s infinite; }
+.status-loading .msg-status-content { background: #e3f2fd; color: #1565c0; }
+.status-loading .msg-status-icon { background: #1976d2; animation: blink 1s infinite; }
+.status-done .msg-status-content { background: #e8f5e9; color: #2e7d32; }
+.status-done .msg-status-icon { background: #4caf50; }
 
 @media (max-width: 900px) {
   .main-container { flex-direction: column; }

@@ -1,16 +1,29 @@
 # Agent Flow — 技能调度交易系统（Demo）
 
-> **这是一个 Demo 项目**，用于展示在 LangGraph 节点编排基础上实现的 Supervisor 循环 Reason-and-Action 架构模式。
+> **这是一个 Demo 项目**，用于展示基于 LangGraph 的 Supervisor 独揽决策架构 — 不依赖独立的 Planner，Supervisor 在拥有完整信息（用户画像 + 技能详情 + API schema）后才做判断。
 
-基于 LangGraph 构建的层级化多智能体交易演示，核心展示 **Supervisor 循环调度（Reason → Action → Observe → Reason）** 与 **SKILL.md 渐进式加载** 的设计模式。
+基于 LangGraph 构建的多智能体交易演示，核心展示 **Supervisor 独揽决策循环（Reason → Action → Observe → Reason）** 与 **SKILL.md 渐进式加载** 的设计模式。
 
-## Demo 目的
+## 架构演进
 
-本项目旨在演示以下技术要点：
+v1 版本包含独立的 Planner 节点（Coordinator → Planner → Supervisor），负责"完整性检查"。但在实际运行中发现 Planner 存在根本性缺陷：
 
-1. **LangGraph 节点编排基础** — 使用 LangGraph 的 `StateGraph` + `Command(goto=...)` 实现全动态路由，各节点通过 State 共享上下文
-2. **Supervisor 循环 Reason-and-Action 流程** — 在 LangGraph 的图上构建一个"推理→行动→观察→再推理"的自治循环，由 Supervisor 作为中央决策器驱动
-3. **SKILL.md 渐进式加载** — 首次只注入技能摘要，按需加载完整 SKILL.md 内容，节省上下文 Token
+**Planner 在 skill 懒加载之前运行，缺少关键信息**:
+- 不知道 API 需要什么参数（如 `check_inventory` 的 `grade` 字段）
+- 没有用户画像数据（如默认地区、偏好品类）
+- 只有技能的一行摘要，没有完整 API 定义
+
+这导致 Planner 的"完整性判断"本质上是盲猜。它说"信息完整"，Supervisor 加载 skill 后发现 API 还需要额外参数，又得弹窗 — Planner 的判断被推翻，LLM 调用完全浪费。
+
+**v2 移除了 Planner**，Supervisor 独揽决策：
+
+```
+v2:  Coordinator → Supervisor ⇄ Tools → Formatter
+```
+
+Supervisor 进入循环后第一步调用 `get_user_context` 获取画像，后续按需 `load_skill_detail` 获取 API 定义。它在**拥有完整信息**后才做完整性判断 — 知道用户画像有什么、API 需要什么，判断精准。
+
+详见 [架构设计文档](docs/ARCHITECTURE.md#为什么没有-planner)。
 
 ## 快速启动
 
@@ -23,31 +36,30 @@ uvicorn app.main:app --reload
 ## 图结构
 
 ```
-START → Coordinator → Planner → Supervisor ⇄ ToolNode → Formatter → END
-                                        ↑___________↓
-                                     Reason-and-Action 循环
+START → Coordinator → Supervisor ⇄ ToolNode → Formatter → END
+                            ↑___________↓
+                         Reason-and-Action 循环
 ```
 
 ### 节点说明
 
 | 节点 | 角色 | 说明 |
 |------|------|------|
-| Coordinator | 入口分流 | 闲聊直接回复，交易需求交给 Planner |
-| Planner | 需求分析 | 分析用户需求，制定结构化执行计划 |
-| **Supervisor** | **中央决策器** | **Reason-and-Action 循环核心，反复推理+决策+调度** |
-| ToolNode | 工具执行 | 执行 Supervisor 指定的工具，结果返回 Supervisor |
+| Coordinator | 入口分流 | 闲聊直接回复，交易需求交给 Supervisor |
+| **Supervisor** | **唯一决策中枢** | **完整性检查 + 技能选择 + API 调度 + 动态应变 + 终止判断** |
+| ToolNode | 工具执行 | 执行 Supervisor 指定的工具(get_user_context/load_skill_detail/call_api) |
 | Formatter | 结果格式化 | 文本/弹窗/卡片三种输出模式 |
 
 ## Supervisor 循环：Reason → Action → Observe → Reason
 
-Supervisor 是整个系统的核心，它实现了一个自治的 Reason-and-Action 循环。这个循环并非简单的线性流水线，而是 Supervisor 在每一步都重新推理当前状态、做出决策、观察结果、再次推理，直到任务完成。
+Supervisor 是系统的唯一大脑，独揽从信息收集到最终输出的全部决策。它在每一步都重新推理当前状态、做出决策、观察结果、再次推理，直到任务完成。
 
 ### 循环工作流
 
 ```
          ┌─────────────────────────┐
          │     Supervisor 推理      │
-         │  (分析当前状态 + 历史)    │
+         │  (画像 + 技能 + API + 历史) │
          └──────────┬──────────────┘
                     │ 结构化决策 (JSON)
                     ▼
@@ -72,18 +84,17 @@ Supervisor 是整个系统的核心，它实现了一个自治的 Reason-and-Act
 
 ### 循环示例
 
-以用户输入 **"在上海买500吨螺纹钢"** 为例，Supervisor 驱动 6 轮 Reason-and-Action 循环：
+以用户输入 **"在上海买500吨螺纹钢"** 为例，Supervisor 驱动 5 轮 Reason-and-Action 循环：
 
 | 轮次 | Reason（推理） | Action（行动） | Observe（观察） |
 |------|---------------|---------------|-----------------|
-| 1 | 需要先了解用户画像和采购偏好 | `get_user_context` | 用户偏好华东地区、螺纹钢 |
-| 2 | 用户在上海，钢联是本地区供应商且主营螺纹钢 | `load_skill_detail("ganglian-supplier")` | 获取钢联的 API 列表 |
-| 3 | 技能已加载，立即查询库存 | `call_api("check_inventory", {螺纹钢})` | 库存 3000 吨，充足 |
+| 1 | 首次进入，必须先了解用户偏好 | `get_user_context` | 偏好螺纹钢，默认地区上海 |
+| 2 | 用户在上海，钢联是本地区供应商且主营螺纹钢 | `load_skill_detail("ganglian-supplier")` | 获取钢联的 API 列表和执行指南 |
+| 3 | 技能已加载，立即查询库存 | `call_api("check_inventory", {螺纹钢})` | 库存 800 吨，充足 |
 | 4 | 库存够，获取 500 吨报价 | `call_api("get_quote", {螺纹钢, 500吨})` | 单价 3850 元/吨 |
-| 5 | 报价拿到，查询配送到上海的物流 | `call_api("check_logistics", {上海, 500吨})` | 陆运 3 天，运费 8000 元 |
-| 6 | 库存/报价/物流全部获取完毕 | `formatter_card` (生成推荐卡片) | 输出结果卡片给用户 |
+| 5 | 库存/报价数据充分 | `formatter_card` (生成推荐卡片) | 输出结果卡片给用户 |
 
-> 每一轮 Supervisor 都根据**上一轮观察到的结果**重新推理，动态决定下一步行动。这不是预定义的流水线，而是自治的循环决策。
+> 每一轮 Supervisor 都根据**上一轮观察到的结果**重新推理。信息不全时（如用户只说"买点钢材"），Supervisor 获取画像后直接弹窗收集缺失信息 — 这不是"兜底"，而是正常的业务交互。
 
 ### 决策输出格式
 
@@ -102,7 +113,7 @@ Supervisor 每轮输出结构化 JSON 作为决策指令：
 - `tools` — 继续循环，调用指定工具，结果返回 Supervisor 再推理
 - `formatter_text` — 循环结束，输出文字回复
 - `formatter_card` — 循环结束，生成推荐卡片
-- `formatter_popup` — 循环结束，弹窗收集用户补充信息
+- `formatter_popup` — 信息不全时弹窗收集，是 Supervisor 执行中的正常交互
 
 ## 项目结构
 
@@ -123,15 +134,14 @@ agent-flow/
 │   ├── api/
 │   │   ├── routes.py                # SSE 流式端点 + 技能管理 API
 │   │   ├── schemas.py               # Request/Response Pydantic 模型
-│   │   └── sse.py                   # SSE 事件生成器 (astream_events)
+│   │   └── sse.py                   # SSE 事件生成器 (thinking/progress/text/popup/card)
 │   ├── graph/
 │   │   ├── state.py                 # AgentState 定义
 │   │   ├── builder.py               # LangGraph 图构建
 │   │   ├── router.py                # Router 类型定义
 │   │   └── nodes/
 │   │       ├── coordinator.py       # 入口分流 (闲聊/交易)
-│   │       ├── planner.py           # 制定结构化执行计划
-│   │       ├── supervisor.py        # 核心循环调度 (structured output)
+│   │       ├── supervisor.py        # 唯一决策中枢 (完整性+技能+API+终止)
 │   │       ├── tools.py             # 工具分发执行
 │   │       └── formatter.py         # 最终输出 (text/popup/card)
 │   ├── skills/
@@ -139,11 +149,11 @@ agent-flow/
 │   │   ├── loader.py               # SKILL.md 解析器
 │   │   └── registry.py             # 双源注册表 (public + custom)
 │   ├── tools/
-│   │   ├── skill_tools.py           # load_skill_detail, get_api_schema
+│   │   ├── skill_tools.py           # load_skill_detail
 │   │   ├── api_tools.py             # call_api (mock)
 │   │   └── user_tools.py            # get_user_context
 │   └── services/
-│       └── llm.py                   # LLM 工厂
+│       └── llm.py                   # LLM 工厂 (支持 response_format)
 ├── static/
 │   ├── index.html                   # 三栏测试界面
 │   ├── app.js                       # SSE 接收 + 事件渲染
@@ -153,6 +163,8 @@ agent-flow/
 │   └── API.md                       # API 文档
 └── pyproject.toml
 ```
+
+> 注意：v2 已移除 `app/graph/nodes/planner.py`。Planner 的职责已并入 Supervisor。
 
 ## 技能格式 (SKILL.md)
 
@@ -194,11 +206,11 @@ version: "1.0"
 
 ### 渐进式加载
 
-Supervisor 的 system prompt 只包含技能摘要 (技能名 + 一句话描述)。需要时才通过 `load_skill_detail` 工具加载完整 SKILL.md 内容，节省 Token。
+Supervisor 的 system prompt 只包含技能摘要 (技能名 + 一句话描述)。需要时才通过 `load_skill_detail` 工具按需加载完整 SKILL.md 内容，节省 Token。
 
 ## 文档
 
-- [架构设计](docs/ARCHITECTURE.md) — 图结构、节点说明、State、SSE 事件、技能系统
+- [架构设计](docs/ARCHITECTURE.md) — 图结构、节点说明、State、SSE 事件、技能系统、架构演进
 - [API 文档](docs/API.md) — SSE 端点 + 技能管理端点
 
 ## 许可证

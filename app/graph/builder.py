@@ -5,7 +5,6 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from app.graph.state import AgentState
 from app.graph.nodes.coordinator import create_coordinator_node
-from app.graph.nodes.planner import create_planner_node
 from app.graph.nodes.supervisor import create_supervisor_node
 from app.graph.nodes.tools import create_tool_node
 from app.graph.nodes.formatter import (
@@ -22,9 +21,10 @@ def build_graph(skill_registry=None):
     """Build the LangGraph workflow.
 
     Graph structure:
-    START → coordinator → (planner → supervisor ⇄ tools) → formatter_* → END
+    START → coordinator → supervisor ⇄ tools → formatter_* → END
 
     All routing is dynamic via Command(goto=...).
+    Supervisor is the sole decision-maker — no separate Planner.
     """
     # Set up tool registry access
     if skill_registry:
@@ -39,7 +39,6 @@ def build_graph(skill_registry=None):
 
     # Create nodes
     coordinator_node = create_coordinator_node()
-    planner_node = create_planner_node(get_summaries)
     supervisor_node = create_supervisor_node(get_summaries)
     tool_node = create_tool_node()
     formatter_text_node = create_formatter_text_node()
@@ -50,7 +49,6 @@ def build_graph(skill_registry=None):
     builder = StateGraph(AgentState)
 
     builder.add_node("coordinator", coordinator_node)
-    builder.add_node("planner", planner_node)
     builder.add_node("supervisor", supervisor_node)
     builder.add_node("tools", tool_node)
     builder.add_node("formatter_text", formatter_text_node)
@@ -61,8 +59,7 @@ def build_graph(skill_registry=None):
     builder.add_edge(START, "coordinator")
 
     # All other edges are dynamic via Command(goto=...) from each node
-    # coordinator → planner | formatter_text
-    # planner → supervisor
+    # coordinator → supervisor | formatter_text
     # supervisor → tools | formatter_text | formatter_popup | formatter_card
     # tools → supervisor (loop back)
     # formatter_* → __end__

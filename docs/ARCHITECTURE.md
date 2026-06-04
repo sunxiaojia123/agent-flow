@@ -1,16 +1,46 @@
 # 架构设计
 
-> 最后更新：2026-05-29
+> 最后更新：2026-06-04
 
 ## 概述
 
-基于 LangManus 层级化多智能体架构的交易 Demo。核心能力：
+基于 LangGraph 的多智能体交易 Demo。核心设计：
 
-1. **Supervisor 循环调度** — Supervisor 通过结构化输出 (JSON) 动态决定每一步，非固定流水线
+1. **Supervisor 独揽决策** — 没有独立的 Planner，Supervisor 是唯一的决策中枢，拥有做出所有决策所需的全部信息
 2. **渐进式技能加载** — Supervisor prompt 只含技能摘要，需要时通过工具加载完整 SKILL.md
-3. **多轮工具调用** — 先用户画像 → 再加载供应商技能 → 查库存 → 报价格 → 问物流 → 生成卡片
-4. **流式输出** — SSE 推送 meta / text / popup / card 多种事件
+3. **多轮工具调用** — 获取用户画像 → 加载供应商技能 → 查库存 → 报价格 → 问物流 → 生成卡片
+4. **流式输出** — SSE 推送 thinking / progress / text / popup / card 多种事件
 5. **内外技能分离** — public/ 内部技能 (5供应商+1用户画像)，custom/ 外部技能 (可热加载)
+
+## 为什么没有 Planner？
+
+v1 版本包含独立的 Planner 节点（Coordinator → Planner → Supervisor）。经过多轮 Agent 讨论和实际运行验证，发现 Planner 存在根本性的架构缺陷，已于 v2 移除。
+
+**Planner 的根本问题：信息鸿沟**
+
+Planner 在 skill 懒加载**之前**运行。此时系统只知道技能的一行摘要（如 "ganglian-supplier: 钢联贸易，主营螺纹钢"），但不知道：
+- 每个 API 的参数定义（如 check_inventory 需要 grade 参数）
+- 用户画像中的默认偏好（如 default_city: 上海）
+- 供应商的具体执行指南
+
+Planner 在这个信息不全的阶段做"完整性检查"（品类/数量/地区是否齐全），本质上是盲猜。它判定"信息完整"放行后，Supervisor 加载 skill 才发现 API 还需要额外参数，又得弹窗——Planner 的判断被推翻，它的 LLM 调用完全浪费。
+
+**Supervisor 为什么更合适**
+
+Supervisor 在循环中运行，可以先调用 `get_user_context` 获取画像、按需 `load_skill_detail` 获取 API 定义，在**拥有完整信息**后判断是否需要弹窗。这个判断是准确的——它知道用户画像有什么、API 需要什么，不会做盲猜。
+
+```
+v1:  Coordinator → Planner → Supervisor ⇄ Tools → Formatter
+     Planner 做完整性检查 ← 但缺少用户画像和 API 参数定义，检查不可靠
+
+v2:  Coordinator → Supervisor ⇄ Tools → Formatter
+     Supervisor 独揽决策 ← 拥有画像 + 技能详情 + API schema，判断精准
+```
+
+**收益**:
+- -1 LLM 调用/交易流
+- 完整性判断从"盲猜"变为"数据驱动"
+- 架构更简洁，职责更清晰
 
 ## 技术栈
 
@@ -37,9 +67,8 @@ SSE 流式端点 (/api/v1/chat/stream)
     ▼
 LangGraph 图 (app/graph/)
     │
-    ├── Coordinator    ── 入口分流 (闲聊直接回复 / 交易→Planner)
-    ├── Planner        ── 结构化 JSON 执行计划
-    ├── Supervisor     ── 核心循环决策 (structured JSON output)
+    ├── Coordinator    ── 入口分流 (闲聊直接回复 / 交易→Supervisor)
+    ├── Supervisor     ── 唯一决策中枢 (完整性检查 + 技能选择 + API 调度 + 结束判断)
     ├── ToolNode       ── 工具分发执行
     └── Formatter      ── 最终格式化 (text/popup/card)
     │
@@ -58,7 +87,7 @@ Tool 工具 (app/tools/)
 
 ## Graph 结构
 
-参考 LangManus 的 7 Agent 架构，简化为 5 节点：
+v2 架构 — Coordinator 直连 Supervisor，无中间 Planner：
 
 ```
 START
@@ -66,15 +95,12 @@ START
   ▼
 coordinator ──── (chitchat) ──→ formatter_text ──→ END
   │
-  │ (trading intent → Command(goto="planner"))
-  ▼
-planner ──→ Command(goto="supervisor")
-  │
+  │ (trading intent → Command(goto="supervisor"))
   ▼
 supervisor ←──────────────────────────┐
   │                                   │
   │ Command(goto="tools")             │ Command(goto="supervisor")
-  │   update={tool_name, tool_args}   │
+  │                                   │
   ▼                                   │
 tools ────────────────────────────────┘
   │
@@ -83,29 +109,29 @@ tools ────────────────────────�
   └── Command(goto="formatter_card")  → formatter_card → END
 ```
 
-**关键**: 所有边通过 `Command(goto=...)` 动态决定，与 LangManus 一致。
+**关键**: 所有边通过 `Command(goto=...)` 动态决定，Supervisor 是唯一的决策枢纽。
 
 ### 节点说明
 
 | 节点 | 类型 | 职责 | 输出路由 |
 |------|------|------|----------|
-| `coordinator` | 路由 | LLM 判断意图: 闲聊/交易 | `planner` 或 `formatter_text` |
-| `planner` | 处理 | 结构化 JSON 计划 (需要哪些技能/API) | `supervisor` |
-| `supervisor` | 核心循环 | 结构化输出决策: tools/formatter_text/formatter_popup/formatter_card | 动态 4 路 |
-| `tools` | 工具执行 | 分发执行 4 种工具 | `supervisor` (loop back) |
+| `coordinator` | 路由 | LLM 判断意图: 闲聊/交易 | `supervisor` 或 `formatter_text` |
+| `supervisor` | **核心循环** | 完整性检查 + 技能选择 + API 调度 + 终止判断 | 动态 4 路 |
+| `tools` | 工具执行 | 分发执行工具(get_user_context/load_skill_detail/call_api) | `supervisor` (loop back) |
 | `formatter_text` | 终端 | 输出文字回复 | END |
-| `formatter_popup` | 终端 | 输出弹窗表单 | END |
+| `formatter_popup` | 终端 | 输出弹窗表单(信息不全或执行中需要补充) | END |
 | `formatter_card` | 终端 | 输出结果卡片 | END |
 
-## LangManus 对照
+### Supervisor 的完整职责
 
-| LangManus | 本系统 | 说明 |
-|-----------|--------|------|
-| Coordinator | **coordinator** | 入口分流 (闲聊直接回复，交易→Planner) |
-| Planner | **planner** | 制定结构化 JSON 计划 |
-| Supervisor | **supervisor** | 核心循环，structured JSON output 路由 |
-| Researcher/Coder/Browser | **tools** | 执行 Supervisor 指定的工具 |
-| Reporter | **formatter** | 格式化最终输出 (text/popup/card) |
+Supervisor 独揽以下所有决策：
+
+1. **完整性自检** — 进入循环第一步 `get_user_context`，获取画像后综合用户历史消息判断品类/数量/地区是否齐全。不全则立即 `formatter_popup`
+2. **技能选择** — 根据用户需求和画像偏好，从可用技能中选择最匹配的供应商
+3. **API 调度** — 按合理顺序调用 check_inventory → get_quote → check_logistics
+4. **动态调整** — 供应商库存不足时切换备选，数据充分时比较推荐
+5. **终止判断** — 信息足够时路由到 formatter_card 或 formatter_text
+6. **弹窗交互** — 信息不足或 API 需要更多参数时，自然地弹窗收集（不是"兜底"，是正常交互）
 
 ## State 设计
 
@@ -113,7 +139,7 @@ tools ────────────────────────�
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]  # 完整对话 + 工具调用历史
     conversation_id: str
-    plan: dict | None                         # Planner 的结构化计划
+    plan: dict | None                         # [已废弃] Planner 移除后保留兼容
     supervisor_decision: dict | None          # 最近一次 Supervisor 路由决策
     coordinator_reply: str | None             # Coordinator 直接回复内容
     final_action: str                         # "text" | "popup" | "card" | ""
@@ -121,9 +147,11 @@ class AgentState(TypedDict):
     popup_fields: list[dict]                  # 弹窗字段定义
     card_type: str                            # "trade" | "selection"
     card_data: dict                           # 卡片数据
+    iteration_count: int                      # Supervisor 循环计数 (安全阀, MAX=15)
+    guidance_message: str                     # 弹窗/卡片前的文字引导
 ```
 
-**关键**: messages 包含完整历史，不做上下文压缩，Supervisor 读取完整历史做决策。
+**关键**: messages 包含完整历史，Supervisor 读取完整历史做决策。上下文窗口取最近 30 条消息，过滤 Supervisor 自己的 AIMessage 防止散文模仿。
 
 ## 技能系统
 
@@ -180,23 +208,22 @@ version: "1.0"
 
 ### 工具定义
 
-Supervisor 可调度的 4 种工具:
+Supervisor 可调度的 3 种工具:
 
 | 工具 | 参数 | 功能 |
 |------|------|------|
+| `get_user_context` | 无 | 加载用户画像+采购历史 (Supervisor 第一轮必调) |
 | `load_skill_detail` | `skill_name: str` | 渐进式加载完整 SKILL.md |
-| `get_api_schema` | `skill_name, api_name` | 获取 API 参数 schema |
 | `call_api` | `skill_name, api_name, params` | 执行 mock API 调用 |
-| `get_user_context` | 无 | 加载用户画像+采购历史 |
 
 ## SSE 事件模型
 
 | event | 来源 | 携带数据 |
 |-------|------|----------|
 | `meta` | 各节点 start/end | `{node, message, status}` — 调度进度 |
-| `meta` (tool_planned) | supervisor 结束后 | `{phase, tool_name, tool_args}` — 展示 Supervisor 决策 |
-| `meta` (supervisor_end) | supervisor 结束后 | `{phase, next, reasoning}` — 结束决策信息 |
-| `text_delta` | formatter_text | `{content}` — 流式文字 |
+| `thinking` | supervisor 结束后 | `{reasoning, next_action, tool_name}` — 推理步骤 |
+| `progress` | tools start/end | `{phase, message, tool_name}` — 工具执行进度 |
+| `text_delta` | formatter_text / guidance | `{content}` — 流式文字 |
 | `text_done` | 流结束 | `{}` |
 | `popup` | formatter_popup | `{fields, message}` — 弹窗表单 |
 | `card` | formatter_card | `{card_type, data}` — 结果卡片 |
@@ -208,30 +235,41 @@ Supervisor 可调度的 4 种工具:
 ```
 用户: "我想在上海买500吨螺纹钢"
 
-coordinator → LLM 判断 "handoff_to_planner" → goto planner
-  [meta: coordinator → planner]
-
-planner → {"thought": "...", "steps": [{"skill": "user-profile", ...}, {"skill": "shagang-supplier", ...}]} → goto supervisor
-  [meta: planner → supervisor]
+coordinator → LLM 判断 "handoff_to_supervisor" → goto supervisor
+  [meta: coordinator → supervisor]
 
 supervisor(1) → {"next": "tools", "tool_name": "get_user_context"} → goto tools
-  [meta: tool_planned → get_user_context]
+  [thinking: 首次进入，先获取用户画像]
 
-tools → 执行 get_user_context → 返回用户画像数据 → goto supervisor
-  [meta: tools → supervisor]
+tools → 执行 get_user_context → 返回用户画像 (偏好螺纹钢, 默认上海) → goto supervisor
 
-supervisor(2) → {"next": "tools", "tool_name": "load_skill_detail", "tool_args": {"skill_name": "shagang-supplier"}} → goto tools
-  [meta: tool_planned → load_skill_detail(shagang-supplier)]
+supervisor(2) → {"next": "tools", "tool_name": "load_skill_detail", 
+                  "tool_args": {"skill_name": "ganglian-supplier"}} → goto tools
+  [thinking: 用户在上海需要螺纹钢，钢联是上海本地供应商，加载其信息]
+  [progress: 加载技能详情: ganglian-supplier]
 
-tools → 加载沙钢 SKILL.md → 返回 API 列表 + 执行说明 → goto supervisor
+tools → 加载钢联 SKILL.md → 返回 API 列表 + 执行说明 → goto supervisor
 
-supervisor(3) → {"next": "tools", "tool_name": "call_api", "tool_args": {"skill_name": "shagang-supplier", "api_name": "check_inventory", "params": {...}}} → goto tools
-  [meta: tool_planned → call_api]
+supervisor(3) → {"next": "tools", "tool_name": "call_api",
+                  "tool_args": {"skill_name": "ganglian-supplier", 
+                                "api_name": "check_inventory", 
+                                "params": {"product_category": "螺纹钢"}}} → goto tools
+  [progress: 调用API: 查询库存]
 
-tools → mock 返回库存数据 → goto supervisor
+tools → mock 返回库存数据 (800吨) → goto supervisor
+  [progress: 查询库存: 库存 800 吨]
 
-supervisor(4) → {"next": "formatter_card", "card_type": "trade", "card_data": {...}} → goto formatter_card
-  [meta: supervisor_end → formatter_card]
+supervisor(4) → {"next": "tools", "tool_name": "call_api",
+                  "tool_args": {"skill_name": "ganglian-supplier",
+                                "api_name": "get_quote",
+                                "params": {"product_category": "螺纹钢", "quantity": 500}}} → goto tools
+  [progress: 调用API: 获取报价]
+
+tools → mock 返回报价 (3850元/吨) → goto supervisor
+  [progress: 获取报价: 3850 元/吨, 总价 1925000 元]
+
+supervisor(5) → {"next": "formatter_card", "card_type": "trade", "card_data": {...}} → goto formatter_card
+  [thinking: 库存和报价均已获取，信息充分，生成推荐卡片]
 
 formatter_card → [card event] → END
   [done]
@@ -239,18 +277,19 @@ formatter_card → [card event] → END
 
 ## 关键设计决策
 
-1. **Command(goto) 动态路由** — 不预设边，每个节点通过 `Command(goto=...)` 决定下一步，与 LangManus 完全一致
-2. **Supervisor 结构化输出** — 标准 JSON 格式路由决策，支持嵌套 JSON 提取
-3. **渐进式加载** — Supervisor prompt 只有技能摘要，按需 `load_skill_detail` 获取完整内容
-4. **ToolNode 统一返回 Supervisor** — 执行-决策循环，Supervisor 评估结果后决定继续还是结束
-5. **全量消息传递** — 不做上下文压缩 (messages 最多保留 20 条)，Supervisor 读取完整历史做决策
-6. **Mock 模式** — `call_api` 直接解析 SKILL.md 中的 mock 返回示例，不发起真实 HTTP 请求
-7. **技能驱动执行** — SKILL.md 中的"执行说明"指导 Supervisor 如何组合调用 API
+1. **Supervisor 独揽决策** — v2 移除了 Planner。Supervisor 在拥有用户画像+技能详情+API schema 全部信息后才做判断，不盲猜
+2. **Command(goto) 动态路由** — 不预设边，每个节点通过 `Command(goto=...)` 决定下一步
+3. **JSON Mode 强制输出** — Supervisor 使用 `response_format={"type": "json_object"}` API 层面保证 JSON
+4. **渐进式加载** — Supervisor prompt 只有技能摘要，按需 `load_skill_detail` 获取完整内容
+5. **ToolNode 统一回 Supervisor** — 执行-决策循环，Supervisor 评估结果后决定继续还是结束
+6. **上下文过滤** — Supervisor 自己的 AIMessage 从上下文窗口过滤掉，防止散文模仿问题
+7. **循环安全阀** — MAX_ITERATIONS=15，防止无限循环
+8. **Mock 模式** — `call_api` 直接解析 SKILL.md 中的 mock 返回示例
+9. **弹窗是正常交互** — 不是"兜底"或"异常"，而是 Supervisor 执行中自然的信息收集手段
 
 ## 扩展点
 
-- **模型替换**: `LLM_MODEL` 环境变量，支持 Claude/GPT-4 等更强大的模型以改善 JSON 输出稳定性
+- **模型替换**: `LLM_MODEL` 环境变量，支持 Claude/GPT-4 等更强大的模型
 - **新增供应商技能**: 在 `skills/public/` 或 `skills/custom/` 下创建新的 SKILL.md，调用 `POST /api/v1/skills/reload` 热加载
-- **真实 API 对接**: 修改 `app/tools/api_tools.py` 中的 `call_api` 函数，发起真实 HTTP 请求
-- **上下文压缩**: 当 messages 超过阈值时增加自动摘要压缩
+- **真实 API 对接**: 修改 `app/tools/api_tools.py` 中的 `call_api` 函数
 - **数据库持久化**: AgentState 添加持久化 checkpointer (当前为 MemorySaver)

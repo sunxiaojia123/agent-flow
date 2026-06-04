@@ -7,6 +7,9 @@ let state = {
   isStreaming: false,
   currentAsstMsg: null,
   phase: 'idle',
+  // Track inline status messages in chat area
+  statusMsgEl: null,
+  lastStatusMsg: '',
 };
 
 // ── DOM refs ──
@@ -43,6 +46,7 @@ async function sendMessage(text) {
   addUserMessage(content);
 
   resetSchedulingPanel();
+  clearStatusMsg();
   addEventLog('info', '发送: ' + content.slice(0, 40));
 
   try {
@@ -96,6 +100,8 @@ function processSSEBuffer(buffer) {
 function handleSSEEvent(eventType, data) {
   switch (data.type) {
     case 'meta': handleMetaEvent(data); break;
+    case 'thinking': handleThinking(data); break;
+    case 'progress': handleProgress(data); break;
     case 'text_delta': handleTextDelta(data); break;
     case 'text_done': handleTextDone(); break;
     case 'popup': handlePopup(data); break;
@@ -108,6 +114,55 @@ function handleSSEEvent(eventType, data) {
   addEventLog(data.type, detail);
 }
 
+// ── Thinking: supervisor reasoning step ──
+function handleThinking(data) {
+  const reasoning = data.reasoning || '';
+  const toolName = data.tool_name || '';
+  const nextAction = data.next_action || '';
+
+  // Build display text
+  let text = '';
+  if (nextAction === 'tools' && toolName) {
+    text = `${reasoning || '决策中...'}`;
+    addDecision(`${toolName} — ${reasoning}`);
+  } else if (nextAction && nextAction.startsWith('formatter')) {
+    text = reasoning || '分析完成，生成结果中...';
+    addDecision(`结束: ${nextAction} — ${reasoning}`);
+  } else {
+    text = reasoning || '分析中...';
+  }
+
+  // Show inline thinking status in chat
+  showStatusMsg(text, 'thinking');
+
+  updatePhase(`思考: ${toolName || nextAction || '决策中'}`);
+}
+
+// ── Progress: tool execution progress ──
+function handleProgress(data) {
+  const phase = data.phase || '';
+  const message = data.message || '';
+  const toolName = data.tool_name || '';
+
+  if (phase === 'tool_start') {
+    showStatusMsg(message, 'loading');
+    addTimelineItem(toolName, 'active');
+    addDecision(`执行: ${message}`);
+    updatePhase(`工具: ${message}`);
+  } else if (phase === 'tool_end') {
+    showStatusMsg(message, 'done');
+    updateTimelineItem(toolName, 'done');
+    addDecision(`完成: ${message}`);
+    updatePhase(`就绪`);
+    // Clear status after a short delay
+    setTimeout(() => {
+      if (state.lastStatusMsg === message) {
+        clearStatusMsg();
+      }
+    }, 2000);
+  }
+}
+
 // ── Meta: node execution & supervisor decisions ──
 function handleMetaEvent(data) {
   if (data.conversation_id && !state.convId) {
@@ -115,36 +170,24 @@ function handleMetaEvent(data) {
     updateStatus();
   }
 
-  // Phase tracking
-  if (data.phase === 'tool_planned') {
-    addDecision(`调用 ${data.tool_name}(${JSON.stringify(data.tool_args || {})})`);
-    updatePhase(`工具调用: ${data.tool_name}`);
-    addTimelineItem(data.tool_name, 'active');
-  } else if (data.phase === 'supervisor_end') {
-    addDecision(`结束: ${data.next} — ${data.reasoning || ''}`);
-    updatePhase(`决策: ${data.next}`);
-  } else if (data.phase === 'tool_done') {
-    updateTimelineItem(data.tool_name, 'done');
-  }
-
   // Node start/end
   if (data.node && data.status === 'start') {
     let displayName = NODE_DISPLAY[data.node] || data.node;
     addTimelineItem(displayName, 'active');
     updatePhase(`节点: ${displayName}`);
+
+    // Show a progress message for longer-running nodes
+    if (data.node === 'supervisor') {
+      showStatusMsg('正在分析当前状态，决定下一步...', 'thinking');
+    }
   } else if (data.node && data.status === 'end') {
     let displayName = NODE_DISPLAY[data.node] || data.node;
     updateTimelineItem(displayName, 'done');
-  }
-
-  if (data.message) {
-    // Keep last active node highlighted
   }
 }
 
 const NODE_DISPLAY = {
   coordinator: '协调员 (Coordinator)',
-  planner: '规划员 (Planner)',
   supervisor: '主管 (Supervisor)',
   tools: '工具执行 (ToolNode)',
   formatter_text: '文本回复',
@@ -154,6 +197,9 @@ const NODE_DISPLAY = {
 
 // ── Text streaming ──
 function handleTextDelta(data) {
+  // Clear status message when actual content starts streaming
+  clearStatusMsg();
+
   if (!state.currentAsstMsg) {
     state.currentAsstMsg = addAsstMessage('');
     state.currentAsstMsg.classList.add('streaming');
@@ -175,14 +221,16 @@ function handleTextDone() {
 
 // ── Popup ──
 function handlePopup(data) {
-  handleTextDone();
+  handleTextDone();  // ensure any streaming text is finalized
+  clearStatusMsg();   // clear status indicators
+
   const card = cloneTemplate('tmplPopupCard');
-  const fieldsDiv = card.querySelector('.popup-fields');
 
   if (data.message) {
     card.querySelector('.popup-header').textContent = data.message;
   }
 
+  const fieldsDiv = card.querySelector('.popup-fields');
   (data.fields || []).forEach(f => {
     const div = document.createElement('div');
     div.className = 'popup-field';
@@ -211,6 +259,21 @@ function handlePopup(data) {
   });
 
   card.querySelector('.popup-submit').addEventListener('click', () => {
+    // Validate required fields are all filled
+    let hasMissing = false;
+    fieldsDiv.querySelectorAll('input, select').forEach(el => {
+      const field = (data.fields || []).find(f => f.name === el.name);
+      if (field && field.required && !el.value) {
+        el.style.borderColor = 'var(--error)';
+        el.style.borderWidth = '2px';
+        hasMissing = true;
+      } else {
+        el.style.borderColor = '';
+        el.style.borderWidth = '';
+      }
+    });
+    if (hasMissing) return;
+
     const values = [];
     fieldsDiv.querySelectorAll('input, select').forEach(el => {
       if (el.value) {
@@ -231,7 +294,9 @@ function handlePopup(data) {
 
 // ── Card ──
 function handleCard(data) {
-  handleTextDone();
+  handleTextDone();  // ensure any streaming text is finalized
+  clearStatusMsg();   // clear status indicators
+
   if (data.card_type === 'selection') {
     renderSelectionCard(data.data);
   } else {
@@ -242,7 +307,6 @@ function handleCard(data) {
 
 function renderTradeCard(d) {
   if (!d || !d.recommendations) {
-    // Try to render as simple text if no structured data
     addAsstMessage(JSON.stringify(d, null, 2));
     return;
   }
@@ -315,9 +379,46 @@ function renderSelectionCard(d) {
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
+// ── Inline status message (chat area) ──
+function showStatusMsg(text, type) {
+  if (!text) return;
+
+  // Don't recreate if same text
+  if (state.lastStatusMsg === text && state.statusMsgEl) return;
+  state.lastStatusMsg = text;
+
+  // Remove old status message
+  if (state.statusMsgEl) {
+    state.statusMsgEl.remove();
+    state.statusMsgEl = null;
+  }
+
+  // Create new status message
+  const el = document.createElement('div');
+  el.className = 'msg msg-status status-' + (type || '');
+  el.innerHTML = `
+    <div class="msg-status-content">
+      <span class="msg-status-icon"></span>
+      <span class="msg-status-text">${escapeHtml(text)}</span>
+    </div>
+  `;
+  chatMessages.appendChild(el);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  state.statusMsgEl = el;
+}
+
+function clearStatusMsg() {
+  if (state.statusMsgEl) {
+    state.statusMsgEl.remove();
+    state.statusMsgEl = null;
+  }
+  state.lastStatusMsg = '';
+}
+
 // ── Error ──
 function handleError(data) {
   handleTextDone();
+  clearStatusMsg();
   const msg = addAsstMessage('错误: ' + data.message);
   msg.querySelector('.msg-content').style.color = 'var(--error)';
 }
@@ -325,6 +426,7 @@ function handleError(data) {
 // ── Done ──
 function handleDone(data) {
   handleTextDone();
+  clearStatusMsg();
   setStreaming(false);
   updatePhase('就绪');
   if (data.conversation_id && !state.convId) {
@@ -362,7 +464,6 @@ function addTimelineItem(id, status) {
 function updateTimelineItem(id, status) {
   let item = timelineItems.get(id);
   if (!item) {
-    // Find by label text
     const items = nodeTimeline.querySelectorAll('.node-item');
     for (const el of items) {
       if (el.querySelector('.node-label').textContent === id) {
@@ -398,7 +499,6 @@ function addDecision(text) {
   decisionList.appendChild(item);
   decisionList.scrollTop = decisionList.scrollHeight;
 
-  // Keep max 50 decisions
   while (decisionList.children.length > 50) {
     decisionList.firstElementChild.remove();
   }
@@ -455,6 +555,10 @@ function mdToHtml(text) {
   return '<p>' + html + '</p>';
 }
 
+function escapeHtml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // ── UI helpers ──
 function addUserMessage(content) {
   const msg = cloneTemplate('tmplUserMsg');
@@ -505,12 +609,13 @@ function addEventLog(type, detail) {
   tag.textContent = type;
   tag.className = 'event-tag tag-' + (
     type === 'meta' ? 'meta' :
+    type === 'thinking' ? 'thinking' :
+    type === 'progress' ? 'tool' :
     type === 'text_delta' ? 'text' :
     type === 'popup' ? 'popup' :
     type === 'card' ? 'card' :
     type === 'error' ? 'error' :
-    type === 'done' ? 'done' :
-    type === 'tool' ? 'tool' : 'meta'
+    type === 'done' ? 'done' : 'meta'
   );
   item.querySelector('.event-detail').textContent = detail || '';
   eventLog.appendChild(item);
@@ -527,6 +632,8 @@ function formatEventDetail(data) {
     if (data.phase === 'supervisor_end') return `Supervisor → ${data.next}: ${data.reasoning || ''}`;
     return `${data.node || ''} ${data.status || ''}`;
   }
+  if (data.type === 'thinking') return `${data.next_action || ''}: ${(data.reasoning || '').slice(0, 60)}`;
+  if (data.type === 'progress') return `${data.phase}: ${data.message || data.tool_name}`;
   if (data.type === 'text_delta') return (data.content || '').slice(0, 60);
   if (data.type === 'popup') return `fields: ${(data.fields || []).map(f => f.name).join(', ')}`;
   if (data.type === 'card') return `${data.card_type}: ${(data.data?.recommendations || []).length || 0} 项`;

@@ -27,6 +27,8 @@ async def chat_stream(request: ChatRequest, req: Request):
         "popup_fields": [],
         "card_type": "",
         "card_data": {},
+        "iteration_count": 0,
+        "guidance_message": "",
     }
 
     config = {"configurable": {"thread_id": conv_id}, "recursion_limit": 50}
