@@ -1,6 +1,6 @@
 # 架构设计
 
-> 最后更新：2026-06-04
+> 最后更新：2026-06-05
 
 ## 概述
 
@@ -9,7 +9,7 @@
 1. **Supervisor 独揽决策** — 没有独立的 Planner，Supervisor 是唯一的决策中枢，拥有做出所有决策所需的全部信息
 2. **渐进式技能加载** — Supervisor prompt 只含技能摘要，需要时通过工具加载完整 SKILL.md
 3. **多轮工具调用** — 获取用户画像 → 加载供应商技能 → 查库存 → 报价格 → 问物流 → 生成卡片
-4. **流式输出** — SSE 推送 thinking / progress / text / popup / card 多种事件
+4. **流式输出** — SSE 推送 meta / thinking / progress / text / popup / card 多种事件
 5. **内外技能分离** — public/ 内部技能 (5供应商+1用户画像)，custom/ 外部技能 (可热加载)
 
 ## 为什么没有 Planner？
@@ -49,6 +49,7 @@ v2:  Coordinator → Supervisor ⇄ Tools → Formatter
 | 编排引擎 | LangGraph + MemorySaver checkpointer |
 | HTTP 框架 | FastAPI + SSE streaming |
 | LLM | langchain-openai (DeepSeek 等兼容接口) |
+| 结构化决策 | Tool Calling (bind_tools) 而非 JSON Mode |
 | 数据模型 | Pydantic v2 |
 | 前端 | 单页 HTML + 原生 JS (零依赖) |
 | 技能存储 | SKILL.md (YAML frontmatter + Markdown body) |
@@ -80,7 +81,6 @@ Skill 系统 (skills/ + app/skills/)
     ▼
 Tool 工具 (app/tools/)
     ├── load_skill_detail ── 渐进式加载 SKILL.md
-    ├── get_api_schema   ── 获取 API 参数结构
     ├── call_api         ── 执行 mock API 调用
     └── get_user_context ── 加载用户画像
 ```
@@ -126,12 +126,21 @@ tools ────────────────────────�
 
 Supervisor 独揽以下所有决策：
 
-1. **完整性自检** — 进入循环第一步 `get_user_context`，获取画像后综合用户历史消息判断品类/数量/地区是否齐全。不全则立即 `formatter_popup`
+1. **完整性自检** — 进入循环第一步 `get_user_context`，获取画像后综合用户历史消息判断品类/数量/地区是否齐全。不全则立即 `route_to_formatter_popup`
 2. **技能选择** — 根据用户需求和画像偏好，从可用技能中选择最匹配的供应商
 3. **API 调度** — 按合理顺序调用 check_inventory → get_quote → check_logistics
 4. **动态调整** — 供应商库存不足时切换备选，数据充分时比较推荐
-5. **终止判断** — 信息足够时路由到 formatter_card 或 formatter_text
+5. **终止判断** — 信息足够时路由到 `route_to_formatter_card` 或 `route_to_formatter_text`
 6. **弹窗交互** — 信息不足或 API 需要更多参数时，自然地弹窗收集（不是"兜底"，是正常交互）
+
+### Coordinator 的消息隔离
+
+Coordinator 是每次请求的入口。为防止其 LLM 被对话历史中的内部执行消息（ToolMessage、带 tool_calls 的 AIMessage）"带偏"而模仿输出 tool call 格式，Coordinator 在判断意图前会过滤消息历史：
+
+- **过滤**: ToolMessage、带 tool_calls 的 AIMessage、内部 SystemMessage（如 `[状态]` 前缀）
+- **保留**: HumanMessage、普通 AIMessage（用户可见的回复内容）
+
+这样 Coordinator 看到的是干净的对话视图，不会产生幻觉 tool call。
 
 ## State 设计
 
@@ -151,7 +160,11 @@ class AgentState(TypedDict):
     guidance_message: str                     # 弹窗/卡片前的文字引导
 ```
 
-**关键**: messages 包含完整历史，Supervisor 读取完整历史做决策。上下文窗口取最近 30 条消息，过滤 Supervisor 自己的 AIMessage 防止散文模仿。
+**消息历史管理**: messages 包含完整历史。Supervisor 发送给 LLM 前会做两层处理：
+1. **过滤** — 删除 `name='supervisor'` 的旧格式 AIMessage（向后兼容）
+2. **清洗** — 对带 tool_calls 的 AIMessage，清空 content（防止 DeepSeek 内联的 raw tool-call 格式泄漏）并截断到 1 个 tool_call（防止 LLM 返回多个 tool_calls 时与单一 ToolMessage 不匹配）
+
+上下文窗口取最近 30 条消息。Supervisor 自己的 AIMessage（无 tool_calls 的路由推理）保留在历史中，供 LLM 了解之前的决策上下文。
 
 ## 技能系统
 
@@ -208,7 +221,7 @@ version: "1.0"
 
 ### 工具定义
 
-Supervisor 可调度的 3 种工具:
+Supervisor 通过 Tool Calling (bind_tools) 可调度的 3 种执行工具:
 
 | 工具 | 参数 | 功能 |
 |------|------|------|
@@ -216,16 +229,18 @@ Supervisor 可调度的 3 种工具:
 | `load_skill_detail` | `skill_name: str` | 渐进式加载完整 SKILL.md |
 | `call_api` | `skill_name, api_name, params` | 执行 mock API 调用 |
 
+另有 3 种路由工具（`route_to_formatter_text/popup/card`）被 Supervisor 拦截，不经过 ToolNode，直接路由到对应 Formatter。
+
 ## SSE 事件模型
 
 | event | 来源 | 携带数据 |
 |-------|------|----------|
 | `meta` | 各节点 start/end | `{node, message, status}` — 调度进度 |
-| `thinking` | supervisor 结束后 | `{reasoning, next_action, tool_name}` — 推理步骤 |
+| `thinking` | supervisor 结束后 | `{reasoning, next_action, tool_name, tool_args}` — 推理步骤 |
 | `progress` | tools start/end | `{phase, message, tool_name}` — 工具执行进度 |
 | `text_delta` | formatter_text / guidance | `{content}` — 流式文字 |
-| `text_done` | 流结束 | `{}` |
-| `popup` | formatter_popup | `{fields, message}` — 弹窗表单 |
+| `text_done` | 文字流结束 | `{}` |
+| `popup` | formatter_popup | `{popup_id, fields, message}` — 弹窗表单 |
 | `card` | formatter_card | `{card_type, data}` — 结果卡片 |
 | `error` | 异常 | `{code, message}` |
 | `done` | 完成 | `{conversation_id}` |
@@ -236,39 +251,34 @@ Supervisor 可调度的 3 种工具:
 用户: "我想在上海买500吨螺纹钢"
 
 coordinator → LLM 判断 "handoff_to_supervisor" → goto supervisor
-  [meta: coordinator → supervisor]
+  [meta: coordinator start → end]
+  [meta: supervisor start]
 
-supervisor(1) → {"next": "tools", "tool_name": "get_user_context"} → goto tools
+supervisor(1) → tool_call: get_user_context → goto tools
   [thinking: 首次进入，先获取用户画像]
 
 tools → 执行 get_user_context → 返回用户画像 (偏好螺纹钢, 默认上海) → goto supervisor
+  [progress: 用户: 张经理, 地区: 上海, 偏好: 螺纹钢, 线材, 热轧卷板]
 
-supervisor(2) → {"next": "tools", "tool_name": "load_skill_detail", 
-                  "tool_args": {"skill_name": "ganglian-supplier"}} → goto tools
-  [thinking: 用户在上海需要螺纹钢，钢联是上海本地供应商，加载其信息]
+supervisor(2) → tool_call: load_skill_detail("ganglian-supplier") → goto tools
+  [thinking: 用户在上海需要螺纹钢，钢联是上海本地供应商]
   [progress: 加载技能详情: ganglian-supplier]
 
 tools → 加载钢联 SKILL.md → 返回 API 列表 + 执行说明 → goto supervisor
 
-supervisor(3) → {"next": "tools", "tool_name": "call_api",
-                  "tool_args": {"skill_name": "ganglian-supplier", 
-                                "api_name": "check_inventory", 
-                                "params": {"product_category": "螺纹钢"}}} → goto tools
+supervisor(3) → tool_call: call_api(check_inventory) → goto tools
   [progress: 调用API: 查询库存]
 
 tools → mock 返回库存数据 (800吨) → goto supervisor
   [progress: 查询库存: 库存 800 吨]
 
-supervisor(4) → {"next": "tools", "tool_name": "call_api",
-                  "tool_args": {"skill_name": "ganglian-supplier",
-                                "api_name": "get_quote",
-                                "params": {"product_category": "螺纹钢", "quantity": 500}}} → goto tools
+supervisor(4) → tool_call: call_api(get_quote, 500吨) → goto tools
   [progress: 调用API: 获取报价]
 
 tools → mock 返回报价 (3850元/吨) → goto supervisor
   [progress: 获取报价: 3850 元/吨, 总价 1925000 元]
 
-supervisor(5) → {"next": "formatter_card", "card_type": "trade", "card_data": {...}} → goto formatter_card
+supervisor(5) → tool_call: route_to_formatter_card({...}) → goto formatter_card
   [thinking: 库存和报价均已获取，信息充分，生成推荐卡片]
 
 formatter_card → [card event] → END
@@ -279,13 +289,14 @@ formatter_card → [card event] → END
 
 1. **Supervisor 独揽决策** — v2 移除了 Planner。Supervisor 在拥有用户画像+技能详情+API schema 全部信息后才做判断，不盲猜
 2. **Command(goto) 动态路由** — 不预设边，每个节点通过 `Command(goto=...)` 决定下一步
-3. **JSON Mode 强制输出** — Supervisor 使用 `response_format={"type": "json_object"}` API 层面保证 JSON
+3. **Tool Calling (bind_tools) 结构化决策** — 使用 LLM 原生 tool_call 而非 JSON Mode。路由工具被 Supervisor 拦截直连 Formatter，执行工具转发 ToolNode 后返回 Supervisor 继续循环。比 JSON Mode 更稳定，避免了 JSON 解析失败的问题
 4. **渐进式加载** — Supervisor prompt 只有技能摘要，按需 `load_skill_detail` 获取完整内容
 5. **ToolNode 统一回 Supervisor** — 执行-决策循环，Supervisor 评估结果后决定继续还是结束
-6. **上下文过滤** — Supervisor 自己的 AIMessage 从上下文窗口过滤掉，防止散文模仿问题
-7. **循环安全阀** — MAX_ITERATIONS=15，防止无限循环
-8. **Mock 模式** — `call_api` 直接解析 SKILL.md 中的 mock 返回示例
-9. **弹窗是正常交互** — 不是"兜底"或"异常"，而是 Supervisor 执行中自然的信息收集手段
+6. **Coordinator 消息隔离** — Coordinator 判断意图前过滤内部执行消息（ToolMessage、带 tool_calls 的 AIMessage），防止 LLM 被 tool call 历史"带偏"而模仿输出
+7. **消息历史清洗** — Supervisor 发送给 LLM 的消息历史经过过滤（移除旧格式）+ 清洗（清空 tool_calls 消息的 content，截断到 1 个 tool_call），防止 DeepSeek 内联 raw tool-call 格式污染后续调用，同时保证 ToolMessage 配对正确
+8. **循环安全阀** — MAX_ITERATIONS=15，防止无限循环。重试机制：LLM 未返回 tool_call 时重试一次
+9. **Mock 模式** — `call_api` 直接解析 SKILL.md 中的 mock 返回示例
+10. **弹窗是正常交互** — 不是"兜底"或"异常"，而是 Supervisor 执行中自然的信息收集手段
 
 ## 扩展点
 

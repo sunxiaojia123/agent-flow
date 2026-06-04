@@ -61,7 +61,7 @@ Supervisor 是系统的唯一大脑，独揽从信息收集到最终输出的全
          │     Supervisor 推理      │
          │  (画像 + 技能 + API + 历史) │
          └──────────┬──────────────┘
-                    │ 结构化决策 (JSON)
+                    │ Tool Calling (bind_tools)
                     ▼
          ┌─────────────────────────┐
          │     执行决策 (Action)    │
@@ -92,28 +92,25 @@ Supervisor 是系统的唯一大脑，独揽从信息收集到最终输出的全
 | 2 | 用户在上海，钢联是本地区供应商且主营螺纹钢 | `load_skill_detail("ganglian-supplier")` | 获取钢联的 API 列表和执行指南 |
 | 3 | 技能已加载，立即查询库存 | `call_api("check_inventory", {螺纹钢})` | 库存 800 吨，充足 |
 | 4 | 库存够，获取 500 吨报价 | `call_api("get_quote", {螺纹钢, 500吨})` | 单价 3850 元/吨 |
-| 5 | 库存/报价数据充分 | `formatter_card` (生成推荐卡片) | 输出结果卡片给用户 |
+| 5 | 库存/报价数据充分 | `route_to_formatter_card` (生成推荐卡片) | 输出结果卡片给用户 |
 
 > 每一轮 Supervisor 都根据**上一轮观察到的结果**重新推理。信息不全时（如用户只说"买点钢材"），Supervisor 获取画像后直接弹窗收集缺失信息 — 这不是"兜底"，而是正常的业务交互。
 
-### 决策输出格式
+### 决策输出机制
 
-Supervisor 每轮输出结构化 JSON 作为决策指令：
+Supervisor 使用 **Tool Calling (bind_tools)** 而非 JSON Mode 进行结构化决策。LLM 原生返回结构化的 tool_call 对象，避免了 JSON 解析的不稳定性。
 
-```json
-{
-  "next": "tools",
-  "tool_name": "call_api",
-  "tool_args": {"skill_name": "ganglian-supplier", "api_name": "check_inventory", "params": {"product_category": "螺纹钢"}},
-  "reasoning": "技能已加载，立即调用 check_inventory 查询螺纹钢库存"
-}
-```
+**路由工具**（被 Supervisor 拦截，直接路由到 Formatter）：
+- `route_to_formatter_text` — 以文字形式回复用户，循环结束
+- `route_to_formatter_popup` — 弹窗收集缺失信息，循环结束
+- `route_to_formatter_card` — 展示交易推荐/选商卡片，循环结束
 
-`next` 的四种路由方向：
-- `tools` — 继续循环，调用指定工具，结果返回 Supervisor 再推理
-- `formatter_text` — 循环结束，输出文字回复
-- `formatter_card` — 循环结束，生成推荐卡片
-- `formatter_popup` — 信息不全时弹窗收集，是 Supervisor 执行中的正常交互
+**执行工具**（转发到 ToolNode，结果返回 Supervisor 继续循环）：
+- `get_user_context` — 获取用户画像、采购历史、偏好品类和地区
+- `load_skill_detail` — 加载指定供应商的完整信息
+- `call_api` — 调用供应商 API 获取实时数据（库存/报价/物流）
+
+Supervisor 每轮调用一个工具，ToolNode 执行后结果返回 Supervisor 继续推理，直到调用路由工具终止循环。
 
 ## 项目结构
 
@@ -134,14 +131,13 @@ agent-flow/
 │   ├── api/
 │   │   ├── routes.py                # SSE 流式端点 + 技能管理 API
 │   │   ├── schemas.py               # Request/Response Pydantic 模型
-│   │   └── sse.py                   # SSE 事件生成器 (thinking/progress/text/popup/card)
+│   │   └── sse.py                   # SSE 事件生成器 (meta/thinking/progress/text/popup/card)
 │   ├── graph/
 │   │   ├── state.py                 # AgentState 定义
 │   │   ├── builder.py               # LangGraph 图构建
-│   │   ├── router.py                # Router 类型定义
 │   │   └── nodes/
 │   │       ├── coordinator.py       # 入口分流 (闲聊/交易)
-│   │       ├── supervisor.py        # 唯一决策中枢 (完整性+技能+API+终止)
+│   │       ├── supervisor.py        # 唯一决策中枢 (bind_tools + Reason-and-Action 循环)
 │   │       ├── tools.py             # 工具分发执行
 │   │       └── formatter.py         # 最终输出 (text/popup/card)
 │   ├── skills/
@@ -153,18 +149,19 @@ agent-flow/
 │   │   ├── api_tools.py             # call_api (mock)
 │   │   └── user_tools.py            # get_user_context
 │   └── services/
-│       └── llm.py                   # LLM 工厂 (支持 response_format)
+│       └── llm.py                   # LLM 工厂
 ├── static/
 │   ├── index.html                   # 三栏测试界面
 │   ├── app.js                       # SSE 接收 + 事件渲染
 │   └── style.css                    # 样式
 ├── docs/
 │   ├── ARCHITECTURE.md              # 架构设计文档
-│   └── API.md                       # API 文档
+│   ├── API.md                       # API 文档
+│   └── UPGRADE-v2.md                # v2 架构升级记录
 └── pyproject.toml
 ```
 
-> 注意：v2 已移除 `app/graph/nodes/planner.py`。Planner 的职责已并入 Supervisor。
+> 注意：v2 已移除 `app/graph/nodes/planner.py` 和 `app/graph/router.py`。Planner 的职责已并入 Supervisor，Router 类型定义已不再使用。
 
 ## 技能格式 (SKILL.md)
 
@@ -212,6 +209,7 @@ Supervisor 的 system prompt 只包含技能摘要 (技能名 + 一句话描述)
 
 - [架构设计](docs/ARCHITECTURE.md) — 图结构、节点说明、State、SSE 事件、技能系统、架构演进
 - [API 文档](docs/API.md) — SSE 端点 + 技能管理端点
+- [v2 升级记录](docs/UPGRADE-v2.md) — 架构演进过程与技术决策
 
 ## 许可证
 
