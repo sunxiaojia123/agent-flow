@@ -251,6 +251,8 @@ async def sse_event_generator(graph, input_state: dict, config: dict):
                         if hasattr(m, "content") and m.content:
                             if hasattr(m, "name") and m.name in ("supervisor",):
                                 continue
+                            if hasattr(m, "tool_calls") and m.tool_calls:
+                                continue
                             content = m.content
                             if isinstance(content, str) and content.strip():
                                 # Stream the entire text as completed chunks

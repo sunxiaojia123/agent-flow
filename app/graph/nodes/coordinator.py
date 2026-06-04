@@ -1,6 +1,6 @@
 """Coordinator node — entry point that classifies intent and routes."""
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 from langgraph.types import Command
 from app.graph.state import AgentState
 from app.services.llm import get_llm
@@ -18,11 +18,35 @@ COORDINATOR_PROMPT = """你是交易助手协调员。判断用户意图，只�
 对于交易需求，你只需要回复 "handoff_to_supervisor" 这几个字，让 Supervisor 来处理。"""
 
 
+def _visible_messages(all_msgs: list) -> list:
+    """Filter messages to only user-visible conversation content.
+
+    Internal execution messages (AIMessage with tool_calls, ToolMessage,
+    supervisor status injections) are stripped so the coordinator sees
+    a clean conversation and is not distracted into mimicking tool calls.
+    """
+    visible = []
+    for m in all_msgs:
+        # Skip tool-execution messages
+        if isinstance(m, ToolMessage):
+            continue
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            continue
+        # Skip internal system messages (supervisor status, prompts)
+        if isinstance(m, SystemMessage):
+            content = getattr(m, "content", "")
+            if content.startswith("[状态]") or "循环计数" in content:
+                continue
+        visible.append(m)
+    return visible
+
+
 def create_coordinator_node():
     llm = get_llm()
 
     def coordinator_node(state: AgentState) -> Command:
-        messages = [SystemMessage(content=COORDINATOR_PROMPT)] + list(state["messages"])
+        visible = _visible_messages(list(state["messages"]))
+        messages = [SystemMessage(content=COORDINATOR_PROMPT)] + visible
         response = llm.invoke(messages)
 
         if "handoff_to_supervisor" in response.content:

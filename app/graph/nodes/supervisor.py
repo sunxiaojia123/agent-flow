@@ -5,10 +5,14 @@ It handles everything: completeness checking, skill selection, API orchestration
 and final output routing. There is no separate Planner — Supervisor owns all decisions.
 
 The loop: Supervisor → ToolNode → Supervisor (repeat until done).
+
+Uses tool calling (bind_tools) instead of JSON mode for structured decisions.
+Route tools (route_to_*) are intercepted by the supervisor — they never reach ToolNode.
+Execution tools (get_user_context, load_skill_detail, call_api) are forwarded to ToolNode
+via the supervisor_decision dict.
 """
 
 import json
-import re
 from langchain_core.messages import SystemMessage, AIMessage
 from langgraph.types import Command
 from app.graph.state import AgentState
@@ -16,259 +20,269 @@ from app.services.llm import get_llm
 
 MAX_ITERATIONS = 15
 
+# ── Tool definitions (OpenAI-compatible dicts for bind_tools) ──
+
+ROUTE_TOOLS = [
+    {
+        "name": "route_to_formatter_text",
+        "description": "以文字形式回复用户。当你已有足够信息、可以直接用文字回答时调用此工具。调用后当前处理循环结束。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "发送给用户的完整文字回复"
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "为什么此时选择文字回复的推理过程"
+                }
+            },
+            "required": ["message", "reasoning"]
+        }
+    },
+    {
+        "name": "route_to_formatter_popup",
+        "description": "弹窗收集用户缺失信息。当你发现缺少关键参数（品类、数量、规格等）或需要用户确认选项时调用此工具。调用后当前处理循环结束。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "弹窗顶部显示的提示文字，解释需要用户补充什么信息"
+                },
+                "popup_fields": {
+                    "type": "array",
+                    "description": "弹窗表单字段列表",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "字段标识符(snake_case)"},
+                            "label": {"type": "string", "description": "显示给用户的字段标签"},
+                            "type": {"type": "string", "enum": ["text", "number", "select"], "description": "text=自由输入, number=数字, select=下拉选择"},
+                            "required": {"type": "boolean", "description": "是否必填"},
+                            "options": {"type": "array", "items": {"type": "string"}, "description": "下拉选项(仅select类型)"},
+                            "min": {"type": "number", "description": "最小值(仅number类型)"}
+                        },
+                        "required": ["name", "label", "type", "required"]
+                    }
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "为什么需要弹窗、缺失了什么信息的推理过程"
+                }
+            },
+            "required": ["message", "popup_fields", "reasoning"]
+        }
+    },
+    {
+        "name": "route_to_formatter_card",
+        "description": "展示结构化结果卡片。当数据已充分获取、可以生成交易推荐卡片或选商卡片时调用此工具。调用后当前处理循环结束。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "card_type": {
+                    "type": "string",
+                    "enum": ["trade", "selection"],
+                    "description": "trade=交易推荐卡片(含供应商/报价/物流), selection=选商卡片(多供应商对比)"
+                },
+                "card_data": {
+                    "type": "object",
+                    "description": "卡片数据。trade卡片需包含summary(product,quantity,unit)和recommendations数组(每项含company_name,city,unit_price,total_price,delivery_days,logistics_cost)。selection卡片含options数组。"
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "为什么数据已充分、可以生成卡片的推理过程"
+                }
+            },
+            "required": ["card_type", "card_data", "reasoning"]
+        }
+    },
+]
+
+EXECUTION_TOOLS = [
+    {
+        "name": "get_user_context",
+        "description": "获取用户画像数据，包括偏好品类、默认地区、采购历史。仅在对话历史中找不到用户画像时才调用。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": "为什么需要获取用户画像的推理"
+                }
+            },
+            "required": ["reasoning"]
+        }
+    },
+    {
+        "name": "load_skill_detail",
+        "description": "加载指定供应商的完整信息（公司介绍、可用API列表、执行指南）。skill_name必须从「当前可用技能」列表中一字不差地复制，严禁编造不存在的技能名。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": "供应商技能名称，必须从可用技能列表中精确复制"
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "为什么选择此供应商的推理"
+                }
+            },
+            "required": ["skill_name", "reasoning"]
+        }
+    },
+    {
+        "name": "call_api",
+        "description": "调用供应商API获取实时数据（库存/报价/物流等）。必须在load_skill_detail之后调用。常用API: check_inventory(查库存), get_quote(获取报价), check_logistics(查物流)。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": "供应商技能名称"
+                },
+                "api_name": {
+                    "type": "string",
+                    "description": "API名称，如check_inventory, get_quote, check_logistics"
+                },
+                "params": {
+                    "type": "object",
+                    "description": "API参数。check_inventory需product_category；get_quote需product_category,quantity；check_logistics需destination,quantity"
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "为什么调用此API、预期获取什么数据的推理"
+                }
+            },
+            "required": ["skill_name", "api_name", "reasoning"]
+        }
+    },
+]
+
+ALL_TOOLS = ROUTE_TOOLS + EXECUTION_TOOLS
+ROUTE_NAME_PREFIX = "route_to_"
+EXECUTION_TOOL_NAMES = {t["name"] for t in EXECUTION_TOOLS}
+
+ROUTE_GOTO_MAP = {
+    "route_to_formatter_text": "formatter_text",
+    "route_to_formatter_popup": "formatter_popup",
+    "route_to_formatter_card": "formatter_card",
+}
+
+# ── Helpers ──
+
+def _tool_args_safe(raw_args) -> dict:
+    """Defensively parse tool_call args into a dict."""
+    if isinstance(raw_args, dict):
+        return dict(raw_args)
+    if isinstance(raw_args, str):
+        try:
+            return json.loads(raw_args)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
+
+
+def _build_route_decision(tool_name: str, tool_args: dict) -> dict:
+    """Convert a route tool call into the supervisor_decision dict."""
+    reasoning = tool_args.pop("reasoning", "")
+    goto = ROUTE_GOTO_MAP[tool_name]
+    decision = {"next": goto, "reasoning": reasoning}
+
+    if goto == "formatter_text":
+        decision["message"] = tool_args.get("message", "")
+    elif goto == "formatter_popup":
+        decision["message"] = tool_args.get("message", "请补充以下信息")
+        decision["popup_fields"] = tool_args.get("popup_fields", [])
+    elif goto == "formatter_card":
+        decision["card_type"] = tool_args.get("card_type", "trade")
+        decision["card_data"] = tool_args.get("card_data", {})
+
+    return decision
+
+
+def _build_execution_decision(tool_name: str, tool_args: dict, tool_call_id: str = "") -> dict:
+    """Convert an execution tool call into the supervisor_decision dict.
+
+    Pops 'reasoning' from tool_args so it doesn't leak into ToolNode.
+    Includes tool_call_id so ToolNode can respond with a matching ToolMessage.
+    """
+    reasoning = tool_args.pop("reasoning", f"调用 {tool_name}")
+    return {
+        "next": "tools",
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "reasoning": reasoning,
+        "tool_call_id": tool_call_id,
+    }
+
+
+# ── System Prompt ──
+
 SUPERVISOR_SYSTEM_PROMPT = """你是交易系统的唯一中央决策大脑(Supervisor)。你运行在一个 Reason-and-Action 自治循环中，独揽从信息收集到最终输出的全部决策。
 
 ## 循环模式
 
-每一轮你执行: 观察当前状态 → 推理分析 → 输出决策JSON → 工具执行 → 结果返回给你 → 再次推理
-这个循环持续进行，直到你判断信息充分、可以给用户最终答案时，路由到 formatter 结束循环。
+每一轮你执行: 观察当前状态 → 推理分析 → 调用工具 → 工具执行 → 结果返回给你 → 再次推理
+这个循环持续进行，直到你判断信息充分、可以给用户最终答案时，调用路由工具结束循环。
 
 ## 可用工具
 
-- **get_user_context**: 获取用户画像、采购历史、偏好品类和地区。无需参数。
-- **load_skill_detail**: 加载指定供应商的完整信息(公司介绍、API列表、执行指南)。参数: skill_name (必填)
-- **call_api**: 调用供应商API获取实时数据(库存/报价/物流等)。参数: skill_name, api_name, params (均为必填)
+路由工具（终止循环并输出结果给用户）:
+- **route_to_formatter_text**: 以文字形式回复用户
+- **route_to_formatter_popup**: 弹窗收集缺失信息（品类/数量/规格等）
+- **route_to_formatter_card**: 展示结构化结果卡片（交易推荐/选商对比）
+
+执行工具（获取数据后继续循环）:
+- **get_user_context**: 获取用户画像、采购历史、偏好品类和地区
+- **load_skill_detail**: 加载指定供应商的完整信息（公司介绍、API列表、执行指南）
+- **call_api**: 调用供应商API获取实时数据（库存/报价/物流等）
 
 ## 决策原则
 
 你是"最强大脑"，拥有做出所有决策所需的全部信息。请根据实际情况自主决策:
 
-1. **第一轮: 获取画像 + 完整性自检**: 进入循环后的**第一步永远是调用 get_user_context**。获取画像后，综合用户历史消息和画像信息判断:
+1. **第一轮: 读取历史 + 缺失补全**: 先检查对话历史中是否已有 `get_user_context` 返回的用户画像。如果已有（弹窗后继续的场景），直接基于画像和弹窗回复继续决策，**不要重复获取画像**。只有在对话历史中找不到画像数据时，才调用 `get_user_context`。获取画像后，综合用户历史消息和画像信息判断:
    - 产品品类是否明确? (用户说了 or 画像有默认偏好)
    - 采购数量是否明确?
    - 所在地区是否明确? (用户说了 or 画像有默认地区)
-   - 如果关键信息不全，**立即路由到 formatter_popup** 收集缺失信息，不要继续调用其他工具浪费资源。
+   - 如果关键信息不全，**立即调用 route_to_formatter_popup** 收集缺失信息，不要继续调用其他工具浪费资源。
    - 如果信息完整，继续下一步。
 
-2. **按需加载**: 信息完整后，只加载与用户需求相关的供应商技能。通常1-2个最匹配的即可。
+2. **按需加载**: 信息完整后，只加载与用户需求相关的供应商技能。通常1-2个最匹配的即可。**技能名必须从「当前可用技能」列表中一字不差地复制**，严禁自行编造不存在的技能名。
 
 3. **数据驱动**: 调用API获取真实数据。拿到库存→获取报价，拿到报价→考虑查物流，信息充分→结束。
 
 4. **灵活应变**: 如果某个供应商库存不足或数据不佳，换另一个供应商。根据实际数据调整策略。
 
-5. **适时终止**: 信息足够支撑结论时果断结束——不要无意义地继续循环。
+5. **适时终止**: 信息足够支撑结论时果断调用路由工具结束——不要无意义地继续循环。
 
-6. **每次只调用一个工具**: ToolNode一次只能执行一个工具。需要多个API时，逐个调用。
+6. **每次只调用一个工具**: 一次只能调用一个工具。需要多个API时，逐个调用。
 
-7. **弹窗是正常交互**: 执行过程中发现需要更多信息时，自然地路由到 formatter_popup 收集。这不是异常兜底，而是正常的业务流程。例如: API返回多种规格型号需要用户确认、发现缺少必要参数等。
+7. **弹窗是正常交互**: 执行过程中发现需要更多信息时，自然地调用 route_to_formatter_popup 收集。这不是异常兜底，而是正常的业务流程。
 
-## 输出格式 (必须是纯JSON)
+## 使用指南
 
-你必须只输出一个JSON对象。不要输出Markdown代码块、不要输出解释文字、不要输出推理过程。`reasoning`字段记录你的推理。
-
-JSON Schema:
-{"next": "<tools|formatter_text|formatter_popup|formatter_card>", "reasoning": "", "tool_name": "", "tool_args": {}, "message": "", "popup_fields": [], "card_type": "", "card_data": {}}
-
-### 示例1 — 第一轮必须获取用户画像:
-{"next": "tools", "tool_name": "get_user_context", "tool_args": {}, "reasoning": "首次进入，必须先获取用户画像了解采购偏好和默认地区"}
-
-### 示例2 — 信息不全，获取画像后直接弹窗:
-{"next": "formatter_popup", "message": "请补充采购信息", "popup_fields": [{"name": "product_category", "label": "产品品类", "type": "text", "required": true}, {"name": "quantity", "label": "采购数量(吨)", "type": "number", "min": 1, "required": true}], "reasoning": "获取画像后，用户未指定品类和数量，画像中也没有默认偏好，直接弹窗收集"}
-
-### 示例3 — 根据画像选择供应商:
-{"next": "tools", "tool_name": "load_skill_detail", "tool_args": {"skill_name": "ganglian-supplier"}, "reasoning": "用户偏好螺纹钢，默认地区上海，钢联是上海本地供应商且主营螺纹钢"}
-
-### 示例4 — 调用API查库存:
-{"next": "tools", "tool_name": "call_api", "tool_args": {"skill_name": "ganglian-supplier", "api_name": "check_inventory", "params": {"product_category": "螺纹钢"}}, "reasoning": "技能已加载，调用check_inventory查螺纹钢库存"}
-
-### 示例5 — 调用API查报价:
-{"next": "tools", "tool_name": "call_api", "tool_args": {"skill_name": "ganglian-supplier", "api_name": "get_quote", "params": {"product_category": "螺纹钢", "quantity": 10}}, "reasoning": "库存充足(800吨)，获取10吨螺纹钢的实时报价"}
-
-### 示例6 — 数据充分，输出推荐卡片:
-{"next": "formatter_card", "card_type": "trade", "card_data": {"summary": {"product": "螺纹钢 HRB400E", "quantity": 10, "unit": "吨"}, "recommendations": [{"company_name": "钢联贸易", "city": "上海", "unit_price": 3900, "total_price": 39000, "delivery_days": 1, "logistics_cost": 200}]}, "reasoning": "库存和报价数据均已获取，信息充分，生成推荐卡片"}
-
-### 示例7 — 执行中需要补充信息，自然弹窗:
-{"next": "formatter_popup", "message": "请确认钢材规格型号", "popup_fields": [{"name": "grade", "label": "规格型号", "type": "select", "options": ["HRB400", "HRB400E", "HRB500"], "required": true}], "reasoning": "API返回多种规格，需要用户确认具体型号后再继续"}
-
-### 示例8 — 文字回复:
-{"next": "formatter_text", "message": "根据查询结果，钢联贸易螺纹钢HRB400E当前库存800吨，单价3900元/吨，10吨总价39000元。上海同城配送1天可达，运费200元。建议选择钢联贸易。", "reasoning": "数据已汇总，以文字形式回复用户"}
+- 每次只调用一个工具。即使需要多个API，也逐个调用。
+- 路由工具会终止当前循环并输出结果给用户。执行工具会返回数据并继续循环。
+- 信息充分时果断调用路由工具结束循环。信息不足时果断调用 route_to_formatter_popup 收集。
+- 不要输出文字，直接调用工具。
 """
 
 
-def _extract_json(text: str) -> dict:
-    """Robust JSON extraction from LLM output.
-
-    Handles: markdown fences, text before/after JSON, trailing commas,
-    and nested objects with balanced braces.
-    """
-    cleaned = text.strip()
-    cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned)
-    cleaned = re.sub(r'\n?```\s*$', '', cleaned)
-    cleaned = cleaned.strip()
-
-    # Attempt 1: direct parse
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 2: find JSON object with balanced braces
-    start = cleaned.find('{')
-    if start == -1:
-        return _generic_fallback(text)
-
-    depth = 0
-    end = -1
-    for i in range(start, len(cleaned)):
-        if cleaned[i] == '{':
-            depth += 1
-        elif cleaned[i] == '}':
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
-
-    if end > start:
-        try:
-            return json.loads(cleaned[start:end])
-        except json.JSONDecodeError:
-            pass
-
-    # Attempt 3: fix common JSON issues (trailing commas, etc.)
-    try:
-        candidate = cleaned[start:end] if end > start else cleaned[start:]
-        candidate = re.sub(r',\s*}', '}', candidate)
-        candidate = re.sub(r',\s*]', ']', candidate)
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        pass
-
-    return _generic_fallback(text)
-
-
-def _generic_fallback(text: str) -> dict:
-    """Generic fallback — extracts intent from LLM prose output.
-
-    Uses Chinese keyword detection first (matching the LLM's Chinese prompt),
-    then falls back to English JSON-pattern detection. If nothing works,
-    gracefully ends with formatter_text.
-    """
-    raw = text[:500]
-
-    # ---- Phase 1: Chinese keyword intent detection ----
-    tool_keywords = ["调用", "查", "获取", "加载", "查询", "执行工具", "调API"]
-    card_keywords = ["卡片", "推荐", "展示结果", "生成卡片"]
-    popup_keywords = ["弹窗", "收集", "补充信息", "请提供"]
-    text_keywords = ["总结", "回复用户", "文字回复", "告知用户"]
-
-    scores: dict[str, int] = {}
-    for kw in tool_keywords:
-        if kw in raw:
-            scores["tools"] = scores.get("tools", 0) + 1
-    for kw in card_keywords:
-        if kw in raw:
-            scores["formatter_card"] = scores.get("formatter_card", 0) + 1
-    for kw in popup_keywords:
-        if kw in raw:
-            scores["formatter_popup"] = scores.get("formatter_popup", 0) + 1
-    for kw in text_keywords:
-        if kw in raw:
-            scores["formatter_text"] = scores.get("formatter_text", 0) + 1
-
-    # Extract tool_name from Chinese patterns like "调用check_inventory" or "调用 get_quote"
-    tool_name = ""
-    cn_tool = re.search(r'调用\s*([a-zA-Z_]\w*)', raw)
-    if cn_tool:
-        tool_name = cn_tool.group(1)
-
-    # Extract skill_name if present
-    skill_name = ""
-    skill_match = re.search(r'skill_name["\s:：]+["\']?([a-zA-Z0-9_-]+)', raw)
-    if skill_match:
-        skill_name = skill_match.group(1)
-
-    # Extract api_name if present
-    api_name = ""
-    api_match = re.search(r'api_name["\s:：]+["\']?([a-zA-Z0-9_-]+)', raw)
-    if api_match:
-        api_name = api_match.group(1)
-
-    # Build tool_args
-    tool_args: dict = {}
-    if skill_name:
-        tool_args["skill_name"] = skill_name
-    if api_name:
-        tool_args["api_name"] = api_name
-    if skill_name and api_name:
-        tool_args.setdefault("params", {})
-
-    if scores:
-        best = max(scores, key=scores.get)
-        if best == "tools":
-            return {
-                "next": "tools",
-                "tool_name": tool_name,
-                "tool_args": tool_args,
-                "reasoning": "从中文输出推断: 需要调用工具",
-                "_parse_error": True,
-            }
-        if best in ("formatter_card", "formatter_popup"):
-            return {
-                "next": best,
-                "message": raw,
-                "card_type": "trade" if best == "formatter_card" else "",
-                "popup_fields": [],
-                "card_data": {},
-                "reasoning": f"从中文输出推断: {best}",
-                "_parse_error": True,
-            }
-        if best == "formatter_text":
-            return {"next": "formatter_text", "message": raw, "reasoning": "从中文输出推断: 文字回复", "_parse_error": True}
-
-    # ---- Phase 2: English JSON-pattern detection ----
-    if re.search(r'"next"\s*:\s*"tools"', raw):
-        eng_tool = re.search(r'"tool_name"\s*:\s*"(\w+)"', raw)
-        tool_name = eng_tool.group(1) if eng_tool else tool_name
-
-        # Extract tool_args with balanced braces (supports nested objects)
-        args_start = raw.find('"tool_args"')
-        tool_args = {}
-        if args_start != -1:
-            brace_start = raw.find('{', args_start)
-            if brace_start != -1:
-                depth = 0
-                brace_end = -1
-                for i in range(brace_start, len(raw)):
-                    if raw[i] == '{':
-                        depth += 1
-                    elif raw[i] == '}':
-                        depth -= 1
-                        if depth == 0:
-                            brace_end = i + 1
-                            break
-                if brace_end > brace_start:
-                    try:
-                        tool_args = json.loads(raw[brace_start:brace_end])
-                    except json.JSONDecodeError:
-                        pass
-
-        return {
-            "next": "tools",
-            "tool_name": tool_name,
-            "tool_args": tool_args,
-            "reasoning": "从LLM输出中提取的工具调用",
-            "_parse_error": True,
-        }
-
-    # Detect formatter intent from English patterns
-    for fmt in ("formatter_text", "formatter_popup", "formatter_card"):
-        if fmt in raw:
-            return {"next": fmt, "message": raw, "reasoning": "从LLM输出中提取的终止指令", "_parse_error": True}
-
-    # ---- Last resort ----
-    return {"next": "formatter_text", "message": raw, "reasoning": "无法解析JSON，作为文本输出", "_parse_error": True}
-
+# ── Node factory ──
 
 def create_supervisor_node(get_summaries):
     """Create the Supervisor node — the sole reasoning brain.
 
-    Supervisor receives available skill summaries and the full conversation
-    history. It handles everything: completeness checking, skill selection,
-    API orchestration, and final output routing.
-
-    The loop: Supervisor → ToolNode → Supervisor (repeat until done).
+    Uses tool calling (bind_tools) for structured decisions instead of JSON mode.
+    Route tools are intercepted here; execution tools are forwarded to ToolNode
+    via the supervisor_decision dict.
     """
-    llm = get_llm(temperature=0.0, response_format={"type": "json_object"})
+    llm = get_llm(temperature=0.0)
+    bound_llm = llm.bind_tools(ALL_TOOLS, tool_choice="required")
 
     def supervisor_node(state: AgentState) -> Command:
         summaries = get_summaries()
@@ -280,22 +294,36 @@ def create_supervisor_node(get_summaries):
         # Inject available skills
         context_parts.append(f"\n## 当前可用技能\n{summaries}")
 
-        # Iteration counter (informational, encourages progress)
+        # Iteration counter
         context_parts.append(f"\n## 循环计数: {iteration}/{MAX_ITERATIONS}")
         if iteration >= MAX_ITERATIONS:
-            context_parts.append("⚠️ 已达到最大循环次数。本轮必须路由到 formatter 结束循环，不得再选择 tools。")
+            context_parts.append(
+                "⚠️ 已达到最大循环次数。本轮必须调用路由工具结束循环，"
+                "不得再选择执行工具。"
+            )
 
         prompt = "\n".join(context_parts)
 
-        # ---- Build message list — filter supervisor's own prose messages ----
+        # ---- Build message list ----
         all_msgs = list(state["messages"])
-        filtered_msgs = [
-            m for m in all_msgs
-            if not (isinstance(m, AIMessage) and getattr(m, 'name', None) == 'supervisor')
-        ]
+        # Filter + sanitize message history.
+        # - Remove old-format supervisor JSON prose (backward compat).
+        # - Sanitize any AIMessage with tool_calls: DeepSeek may include raw
+        #   formatting (e.g. <|tool_calls_section_begin|>...) in content.
+        #   Clear content but KEEP tool_calls — ToolMessage pairing requires
+        #   a preceding AIMessage with matching tool_calls.
+        filtered_msgs = []
+        for m in all_msgs:
+            if isinstance(m, AIMessage) and getattr(m, 'name', None) == 'supervisor':
+                continue
+            if isinstance(m, AIMessage) and getattr(m, 'tool_calls', None):
+                # Only keep the first tool_call — we only ever execute one.
+                # Multiple tool_calls with <N ToolMessages → 400 error.
+                tc = m.tool_calls
+                m = AIMessage(content="", tool_calls=tc[:1], id=m.id)
+            filtered_msgs.append(m)
 
-        # Inject a concise status summary as SystemMessage (not AIMessage)
-        # so the LLM knows what's been done without mimicking prose
+        # Status injection
         last_decision = state.get("supervisor_decision", {})
         if last_decision:
             last_goto = last_decision.get("next", "")
@@ -311,45 +339,115 @@ def create_supervisor_node(get_summaries):
         recent_msgs = filtered_msgs[-30:] if len(filtered_msgs) > 30 else filtered_msgs
         messages = [SystemMessage(content=prompt)] + recent_msgs
 
-        # ---- LLM call + JSON extraction ----
-        response = llm.invoke(messages)
-        decision = _extract_json(response.content)
+        # ---- LLM call with tool calling ----
+        try:
+            response = bound_llm.invoke(messages)
+        except Exception as e:
+            # If tool calling is not supported by the provider, fall back gracefully
+            error_msg = str(e)
+            decision = {
+                "next": "formatter_text",
+                "message": "抱歉，处理过程中遇到问题，请重新描述您的需求。",
+                "reasoning": f"LLM调用失败: {error_msg[:200]}",
+            }
+            return Command(goto="formatter_text", update={
+                "supervisor_decision": decision,
+                "iteration_count": iteration,
+                "final_action": "text",
+                "messages": [AIMessage(content=decision["message"])],
+            })
 
-        # ---- Retry once on parse failure with clearer feedback ----
-        if decision.get("_parse_error"):
+        tool_calls = getattr(response, "tool_calls", None) or []
+
+        # ---- Retry once if no tool_call ----
+        if not tool_calls:
             retry_prompt = (
                 prompt
-                + "\n\n## ⚠️ 上一轮输出无法解析为合法JSON\n"
-                + f"你的上轮输出: {response.content[:300]}\n\n"
-                + "请严格按照格式要求，只输出一行JSON对象。不要用```json```包裹。不要输出推理文字。"
+                + "\n\n## ⚠️ 必须调用工具\n"
+                + "你上一轮没有调用任何工具。你必须从可用工具中选择一个:\n"
+                + "- 已有足够信息回复用户 → route_to_formatter_text\n"
+                + "- 需要向用户收集信息 → route_to_formatter_popup\n"
+                + "- 已有完整数据展示结果 → route_to_formatter_card\n"
+                + "- 需要更多数据 → get_user_context / load_skill_detail / call_api\n"
+                + "不要输出文字，直接调用一个工具。"
             )
             retry_messages = [SystemMessage(content=retry_prompt)] + recent_msgs
-            retry_response = llm.invoke(retry_messages)
-            decision = _extract_json(retry_response.content)
-            if decision.get("_parse_error"):
+            try:
+                response = bound_llm.invoke(retry_messages)
+            except Exception:
+                response = None
+            tool_calls = getattr(response, "tool_calls", None) or [] if response else []
+
+        # ---- Process tool_call or fallback ----
+        if tool_calls:
+            tool_call = tool_calls[0]
+            tool_name = tool_call.get("name", "")
+            raw_args = tool_call.get("args", {})
+            tool_args = _tool_args_safe(raw_args)
+            tc_id = tool_call.get("id", "")
+
+            if tool_name.startswith(ROUTE_NAME_PREFIX):
+                # Route tool — intercepted here, forwarded to formatter
+                decision = _build_route_decision(tool_name, tool_args)
+                goto = decision["next"]
+            elif tool_name in EXECUTION_TOOL_NAMES:
+                # Execution tool — routed through ToolNode with tool_call_id
+                decision = _build_execution_decision(tool_name, tool_args, tc_id)
+                goto = "tools"
+            else:
+                # Unknown tool — fallback (should not happen with bind_tools)
                 decision = {
                     "next": "formatter_text",
-                    "message": "抱歉，处理过程中遇到问题，请重新描述您的需求。",
-                    "reasoning": "两次JSON解析均失败，强制终止",
+                    "message": f"未知工具: {tool_name}",
+                    "reasoning": f"LLM调用了未注册的工具: {tool_name}",
                 }
+                goto = "formatter_text"
+        else:
+            # Double fallback: no tool calls after retry
+            fallback_msg = (
+                (getattr(response, "content", "") or "").strip()
+                or "抱歉，处理过程中遇到问题，请重新描述您的需求。"
+            )
+            decision = {
+                "next": "formatter_text",
+                "message": fallback_msg[:500],
+                "reasoning": "两次调用均未产生工具调用，强制终止",
+            }
+            goto = "formatter_text"
 
         # ---- Safety: force termination at max iterations ----
-        goto = decision.get("next", "formatter_text")
         if iteration >= MAX_ITERATIONS and goto == "tools":
             goto = "formatter_text"
+            decision["next"] = "formatter_text"
             if not decision.get("message"):
                 decision["message"] = "已达到最大处理步骤，以下是根据当前数据的结果汇总。"
+            decision["reasoning"] = (
+                decision.get("reasoning", "") + " [达到最大迭代次数，强制终止]"
+            )
 
         # ---- Build state update ----
-        update = {
+        # For execution tools: store raw response with tool_calls — ToolNode
+        # follows up with a ToolMessage matching the tool_call_id. Correct pairing.
+        # For route tools: store a clean AIMessage without tool_calls —
+        # route tools bypass ToolNode, so no ToolMessage follows. An unmatched
+        # tool_calls entry would break the API on the next request.
+        if goto == "tools":
+            # Store only the tool_call we actually executed. If the LLM returns
+            # multiple tool_calls, storing all of them would violate the API
+            # contract: ToolNode only produces ONE ToolMessage, so N tool_calls
+            # with <N ToolMessages → "insufficient tool messages" 400 error.
+            msg_for_history = AIMessage(
+                content="",
+                tool_calls=[tool_call],
+                id=response.id,
+            )
+        else:
+            msg_for_history = AIMessage(content=decision.get("reasoning", ""))
+
+        update: dict = {
             "supervisor_decision": decision,
             "iteration_count": iteration,
-            "messages": [
-                AIMessage(
-                    content=json.dumps(decision, ensure_ascii=False),
-                    name="supervisor",
-                )
-            ],
+            "messages": [msg_for_history],
         }
 
         # Bridge formatter data into state

@@ -16,19 +16,12 @@ async def chat_stream(request: ChatRequest, req: Request):
     conv_id = request.conversation_id or str(uuid.uuid4())
     graph = req.app.state.graph
 
+    # Only pass messages — let LangGraph's checkpointer restore all other
+    # state fields from the previous run. Passing defaults would overwrite
+    # the checkpointed state and break conversation continuity.
     input_state = {
         "messages": [HumanMessage(content=request.message)],
         "conversation_id": conv_id,
-        "plan": None,
-        "supervisor_decision": None,
-        "coordinator_reply": None,
-        "final_action": "",
-        "popup_message": "",
-        "popup_fields": [],
-        "card_type": "",
-        "card_data": {},
-        "iteration_count": 0,
-        "guidance_message": "",
     }
 
     config = {"configurable": {"thread_id": conv_id}, "recursion_limit": 50}
